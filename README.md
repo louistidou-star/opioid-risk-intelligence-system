@@ -15,6 +15,10 @@ Opioid misuse, irregular dosing behavior, and medication adherence failures rema
 - SOC-style alert panel for analyst review
 - Interactive charts and downloadable alert outputs
 - Deployed web application accessible through a live Streamlit interface
+  
+## Notes
+
+This project is a prototype for demonstration and analytical evaluation purposes. It uses sample and simulated event data and is not intended for direct clinical deployment without appropriate security, privacy, compliance, and infrastructure controls.
 
 ## Tech stack
 
