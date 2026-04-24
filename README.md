@@ -1,41 +1,169 @@
-# National Opioid Risk Intelligence System
+# National Opioid Risk Intelligence Platform (NORIP)
 
-A deployed healthcare risk intelligence prototype that applies SIEM-style monitoring, rule-based detection, and machine learning anomaly analysis to opioid usage data. The system supports patient event input, real-time alert generation, risk scoring, and analyst-facing visualization through a web-based dashboard.
+## Overview
 
-## Why it matters
+The National Opioid Risk Intelligence Platform (NORIP) is a cybersecurity-inspired healthcare analytics system designed to monitor medication adherence, detect behavioral risk patterns, and support analyst-driven intervention workflows.
 
-Opioid misuse, irregular dosing behavior, and medication adherence failures remain major public health concerns. This system demonstrates how cybersecurity-inspired monitoring principles can be adapted to healthcare risk analysis by turning medication-related events into structured signals that can be analyzed, scored, and escalated.
+The platform combines principles from SIEM (Security Information and Event Management), machine learning, and public health monitoring to identify high-risk opioid usage behaviors in near real-time.
 
-## Key features
+---
 
-- Real-time patient input simulation through a phone-friendly sidebar form
-- Rule-based alert generation for suspicious or high-risk medication patterns
-- Machine learning anomaly detection using Isolation Forest
-- Risk scoring based on dosage, refill behavior, and supply patterns
-- SOC-style alert panel for analyst review
-- Interactive charts and downloadable alert outputs
-- Deployed web application accessible through a live Streamlit interface
-  
-## Notes
+## Key Features
 
-This project is a prototype for demonstration and analytical evaluation purposes. It uses sample and simulated event data and is not intended for direct clinical deployment without appropriate security, privacy, compliance, and infrastructure controls.
+### 1. Medication Event Tracking
 
-## Tech stack
+* Timestamped medication intake events
+* Scheduled vs. actual intake comparison
+* Persistent storage using SQLite
+* Full audit trail of all changes (create/update)
 
-- Python
-- Streamlit
-- Pandas
-- Scikit-learn
-- Plotly
+### 2. Adherence Monitoring
 
-## Project structure
+* Doses taken on time
+* Missed dose tracking
+* Adherence percentage calculation
+* Late dose detection
+* Missed-dose and late-dose streak analysis
 
-```text
-opioid-risk-intelligence-system/
-│
-├── app.py
-├── detection.py
-├── requirements.txt
-├── .gitignore
-└── data/
-    └── sample_events.csv
+### 3. Behavioral Risk Detection
+
+* Early redosing detection
+* Multiple doses within short time windows
+* Nighttime medication usage patterns
+* Long gaps between doses
+* Timing variability analysis
+
+### 4. Risk Scoring Engine
+
+* Multi-factor rule-based scoring system
+* Behavioral + adherence + alert-based risk contributions
+* Recency-weighted scoring
+* Risk levels: Low, Moderate, High, Critical
+* Explainable risk components per patient
+
+### 5. Machine Learning Integration
+
+* Random Forest model for risk prediction
+* High-risk probability estimation
+* Feature importance visualization
+* Hybrid rule-based + ML scoring approach
+
+### 6. Temporal Risk Intelligence
+
+* Risk trend tracking over time
+* Daily aggregation of patient risk
+* Rolling risk score analysis
+* Risk spike detection (sudden increases in risk)
+
+### 7. Alert Detection & Management
+
+* Rule-based alerts (severity: Medium, High)
+* Machine learning anomaly alerts
+* Alert lifecycle workflow:
+
+  * Open
+  * Reviewed
+  * Escalated
+  * Resolved
+  * False Positive
+* Analyst notes and assignment tracking
+
+### 8. Analyst Dashboard
+
+* Patient-level monitoring interface
+* Risk trend visualization
+* Medication timeline view
+* Alert history per patient
+* Filtering by risk level, drug, and alert presence
+* Editable patient event records
+
+### 9. Reporting System
+
+* Exportable patient reports (CSV)
+* Includes:
+
+  * Risk summary
+  * Adherence metrics
+  * Alert summaries
+  * Full medication timeline
+
+### 10. Audit Trail & Data Integrity
+
+* Full logging of all data modifications
+* Previous vs. new value tracking
+* Changed-field highlighting
+* User attribution (who made changes and when)
+
+### 11. Role-Based Access Control
+
+* Patient: submit and view personal data
+* Analyst: monitor, analyze, and review alerts
+* Admin: access audit logs and system controls
+* Restricted access to sensitive features
+
+---
+
+## System Architecture
+
+The platform is structured as a modular analytics system:
+
+* **Frontend:** Streamlit-based interface (Patient + Analyst views)
+* **Backend:** Python with SQLite database
+* **Detection Engine:** Rule-based + ML anomaly detection
+* **Data Layer:** Event logging, audit tracking, and persistence
+* **Analytics Layer:** Risk scoring, trend analysis, and feature engineering
+
+---
+
+## Technologies Used
+
+* Python 3.11
+* Streamlit
+* Pandas
+* Scikit-learn (Random Forest)
+* Plotly
+* SQLite
+
+---
+
+## Use Case
+
+This system demonstrates how cybersecurity methodologies (SIEM, anomaly detection, audit logging) can be adapted to healthcare monitoring to:
+
+* Detect risky medication behavior
+* Improve adherence visibility
+* Support analyst-driven intervention workflows
+* Provide explainable and auditable risk intelligence
+
+---
+
+## Limitations (Prototype)
+
+* No real patient authentication system
+* Machine learning model trained on synthetic/rule-derived labels
+* No external clinical data integration
+* No automated notification or intervention system
+
+---
+
+## Future Enhancements
+
+* Intervention and notification system (analyst actions and follow-ups)
+* Mobile-friendly patient interface
+* Drug-specific clinical rules and thresholds
+* Real-world model training with outcome data
+* Secure authentication and patient identity mapping
+
+---
+
+## Author
+
+Louis Tidou
+Technology Management (Cybersecurity)
+University of Bridgeport
+
+---
+
+## License
+
+This project is for educational and research purposes.
