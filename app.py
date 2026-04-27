@@ -1,5 +1,7 @@
 from datetime import date, datetime, time
 import json
+import hashlib
+import sqlite3
 
 import pandas as pd
 import plotly.express as px
@@ -201,6 +203,12 @@ def render_status_badge(risk_level: str):
     )
 
 
+# ------------------------------------------------------------
+# Public demo configuration
+# ------------------------------------------------------------
+# Access controls have been removed for the public research prototype.
+# The app uses synthetic/demo data and all modes are available for demonstration.
+
 def validate_event_input(
     patient_id: str,
     submitted_by: str,
@@ -256,6 +264,106 @@ def validate_event_input(
     }
 
 
+
+def build_dose_timing_flags(events_df: pd.DataFrame) -> pd.DataFrame:
+    """Create event-level flags for suspicious dose timing patterns.
+
+    Flags are based on patient + drug history:
+    - early_redose_flag: a taken dose less than 4 hours after the prior taken dose
+    - frequent_6h_flag: 3 or more taken doses within a rolling 6-hour window
+    - frequent_24h_flag: 4 or more taken doses within a rolling 24-hour window
+    - nighttime_use_flag: taken dose between 10 PM and 5 AM
+    - long_gap_flag: more than 36 hours since the prior taken dose
+    """
+    output_columns = [
+        "id",
+        "patient_id",
+        "drug",
+        "event_time",
+        "status",
+        "hours_since_last_taken",
+        "taken_count_6h",
+        "taken_count_24h",
+        "early_redose_flag",
+        "frequent_6h_flag",
+        "frequent_24h_flag",
+        "nighttime_use_flag",
+        "long_gap_flag",
+        "dose_timing_alert",
+    ]
+
+    if events_df.empty:
+        return pd.DataFrame(columns=output_columns)
+
+    ev = events_df.copy()
+    if "id" not in ev.columns:
+        ev["id"] = range(1, len(ev) + 1)
+
+    ev["patient_id"] = ev["patient_id"].astype(str).str.strip()
+    ev["drug"] = ev["drug"].astype(str).str.strip()
+    ev["event_time"] = pd.to_datetime(ev["event_time"], errors="coerce")
+    ev["status"] = ev["status"].astype(str)
+    ev = ev.dropna(subset=["event_time"])
+
+    if ev.empty:
+        return pd.DataFrame(columns=output_columns)
+
+    ev = ev.sort_values(["patient_id", "drug", "event_time"])
+    ev["hours_since_last_taken"] = pd.NA
+    ev["taken_count_6h"] = 0
+    ev["taken_count_24h"] = 0
+    ev["early_redose_flag"] = False
+    ev["frequent_6h_flag"] = False
+    ev["frequent_24h_flag"] = False
+    ev["nighttime_use_flag"] = False
+    ev["long_gap_flag"] = False
+
+    for (_, _), group in ev.groupby(["patient_id", "drug"], dropna=True):
+        taken = group[group["status"] == "Taken"].copy()
+        if taken.empty:
+            continue
+
+        taken_times = taken["event_time"].tolist()
+        taken_indices = taken.index.tolist()
+
+        for position, idx in enumerate(taken_indices):
+            current_time = taken_times[position]
+            hour = current_time.hour
+
+            if position > 0:
+                previous_time = taken_times[position - 1]
+                hours_since = (current_time - previous_time).total_seconds() / 3600.0
+                ev.at[idx, "hours_since_last_taken"] = round(hours_since, 2)
+                ev.at[idx, "early_redose_flag"] = hours_since < 4
+                ev.at[idx, "long_gap_flag"] = hours_since > 36
+
+            count_6h = sum(
+                0 <= (current_time - prior_time).total_seconds() / 3600.0 <= 6
+                for prior_time in taken_times[: position + 1]
+            )
+            count_24h = sum(
+                0 <= (current_time - prior_time).total_seconds() / 3600.0 <= 24
+                for prior_time in taken_times[: position + 1]
+            )
+
+            ev.at[idx, "taken_count_6h"] = count_6h
+            ev.at[idx, "taken_count_24h"] = count_24h
+            ev.at[idx, "frequent_6h_flag"] = count_6h >= 3
+            ev.at[idx, "frequent_24h_flag"] = count_24h >= 4
+            ev.at[idx, "nighttime_use_flag"] = hour >= 22 or hour < 5
+
+    flag_cols = [
+        "early_redose_flag",
+        "frequent_6h_flag",
+        "frequent_24h_flag",
+        "nighttime_use_flag",
+        "long_gap_flag",
+    ]
+    ev["dose_timing_alert"] = ev[flag_cols].any(axis=1)
+    ev["hours_since_last_taken"] = pd.to_numeric(ev["hours_since_last_taken"], errors="coerce")
+
+    return ev[output_columns]
+
 def build_patient_behavior_features(events_df: pd.DataFrame) -> pd.DataFrame:
     output_columns = [
         "patient_id",
@@ -271,6 +379,13 @@ def build_patient_behavior_features(events_df: pd.DataFrame) -> pd.DataFrame:
         "missed_streak",
         "late_streak",
         "timing_variability_hours",
+        "avg_hours_between_taken",
+        "early_redose_count",
+        "frequent_dose_6h_count",
+        "frequent_dose_24h_count",
+        "nighttime_use_count",
+        "long_gap_count",
+        "dose_timing_alert_count",
         "last_reported_intake",
     ]
 
@@ -297,6 +412,32 @@ def build_patient_behavior_features(events_df: pd.DataFrame) -> pd.DataFrame:
         (ev["event_time"] - ev["scheduled_time"]).dt.total_seconds() / 3600.0
     )
     ev.loc[ev["status"] != "Taken", "timing_diff_hours"] = pd.NA
+
+    timing_flags = build_dose_timing_flags(ev)
+    if not timing_flags.empty:
+        timing_flags["hours_since_last_taken"] = pd.to_numeric(
+            timing_flags["hours_since_last_taken"], errors="coerce"
+        )
+        timing_summary = timing_flags.groupby("patient_id", dropna=True).agg(
+            avg_hours_between_taken=("hours_since_last_taken", "mean"),
+            early_redose_count=("early_redose_flag", "sum"),
+            frequent_dose_6h_count=("frequent_6h_flag", "sum"),
+            frequent_dose_24h_count=("frequent_24h_flag", "sum"),
+            nighttime_use_count=("nighttime_use_flag", "sum"),
+            long_gap_count=("long_gap_flag", "sum"),
+            dose_timing_alert_count=("dose_timing_alert", "sum"),
+        ).reset_index()
+    else:
+        timing_summary = pd.DataFrame(columns=[
+            "patient_id",
+            "avg_hours_between_taken",
+            "early_redose_count",
+            "frequent_dose_6h_count",
+            "frequent_dose_24h_count",
+            "nighttime_use_count",
+            "long_gap_count",
+            "dose_timing_alert_count",
+        ])
 
     summary = ev.groupby("patient_id", dropna=True).agg(
         total_events=("patient_id", "size"),
@@ -339,8 +480,25 @@ def build_patient_behavior_features(events_df: pd.DataFrame) -> pd.DataFrame:
 
     summary = summary.merge(missed_streak_df, on="patient_id", how="left")
     summary = summary.merge(late_streak_df, on="patient_id", how="left")
+    summary = summary.merge(timing_summary, on="patient_id", how="left")
     summary["missed_streak"] = summary["missed_streak"].fillna(0).astype(int)
     summary["late_streak"] = summary["late_streak"].fillna(0).astype(int)
+
+    timing_defaults = {
+        "avg_hours_between_taken": 0,
+        "early_redose_count": 0,
+        "frequent_dose_6h_count": 0,
+        "frequent_dose_24h_count": 0,
+        "nighttime_use_count": 0,
+        "long_gap_count": 0,
+        "dose_timing_alert_count": 0,
+    }
+    for col, default in timing_defaults.items():
+        summary[col] = pd.to_numeric(summary[col], errors="coerce").fillna(default)
+
+    summary["avg_hours_between_taken"] = summary["avg_hours_between_taken"].round(2)
+    for col in [c for c in timing_defaults if c != "avg_hours_between_taken"]:
+        summary[col] = summary[col].astype(int)
 
     return summary[output_columns]
 
@@ -506,6 +664,13 @@ def compute_enhanced_risk_scores(
         "missed_streak": 0,
         "late_streak": 0,
         "timing_variability_hours": 0,
+        "avg_hours_between_taken": 0,
+        "early_redose_count": 0,
+        "frequent_dose_6h_count": 0,
+        "frequent_dose_24h_count": 0,
+        "nighttime_use_count": 0,
+        "long_gap_count": 0,
+        "dose_timing_alert_count": 0,
         "total_rule_alerts": 0,
         "high_alert_count": 0,
         "medium_alert_count": 0,
@@ -570,6 +735,21 @@ def compute_enhanced_risk_scores(
         if row["timing_variability_hours"] >= 8:
             add_points("timing", 10, "extreme dose timing variability")
 
+        if row["early_redose_count"] >= 1:
+            add_points("dose_frequency", 20, "early redosing detected")
+        if row["early_redose_count"] >= 2:
+            add_points("dose_frequency", 10, "repeated early redosing")
+        if row["frequent_dose_6h_count"] >= 1:
+            add_points("dose_frequency", 20, "multiple doses within 6 hours")
+        if row["frequent_dose_24h_count"] >= 1:
+            add_points("dose_frequency", 15, "high dose frequency within 24 hours")
+        if row["nighttime_use_count"] >= 2:
+            add_points("dose_timing", 10, "repeated nighttime medication use")
+        if row["long_gap_count"] >= 1:
+            add_points("dose_timing", 10, "long gap between reported doses")
+        if row["dose_timing_alert_count"] >= 3:
+            add_points("dose_frequency", 10, "persistent suspicious dose timing pattern")
+
         if row["missed_count"] >= 2:
             add_points("missed_doses", 10, "multiple missed doses")
         if row["recent_missed_7d"] >= 1:
@@ -607,6 +787,10 @@ def compute_enhanced_risk_scores(
             add_points("interaction", 10, "missed-dose cluster + anomaly combination")
         if row["medium_alert_count"] >= 3 and row["on_time_pct"] < 80:
             add_points("interaction", 10, "alert escalation + poor timing combination")
+        if row["early_redose_count"] >= 1 and row["anomaly_severity"] >= 0.5:
+            add_points("interaction", 10, "early redosing + anomaly combination")
+        if row["frequent_dose_6h_count"] >= 1 and row["recent_missed_7d"] >= 1:
+            add_points("interaction", 10, "irregular missed-dose and redosing pattern")
 
         recency_boost = 0
         if row["recent_missed_3d"] >= 1:
@@ -661,6 +845,12 @@ def run_random_forest_risk_model(df: pd.DataFrame) -> pd.DataFrame:
         "missed_streak",
         "late_streak",
         "timing_variability_hours",
+        "early_redose_count",
+        "frequent_dose_6h_count",
+        "frequent_dose_24h_count",
+        "nighttime_use_count",
+        "long_gap_count",
+        "dose_timing_alert_count",
         "medium_alert_count",
         "high_alert_count",
         "ml_alert_count",
@@ -790,13 +980,224 @@ def highlight_changes(row_style):
     ]
 
 
+
+# ------------------------------------------------------------
+# Alert review workflow helpers
+# ------------------------------------------------------------
+ALERT_REVIEW_DB = "opioid_risk.db"
+ALERT_STATUSES = ["Open", "Reviewed", "Escalated", "Resolved", "False Positive"]
+ALERT_STATUS_ORDER = {status: idx for idx, status in enumerate(ALERT_STATUSES)}
+
+
+def get_alert_review_connection():
+    return sqlite3.connect(ALERT_REVIEW_DB)
+
+
+def init_alert_review_db():
+    """Create a persistent alert review table for analyst workflow state."""
+    with get_alert_review_connection() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS alert_reviews (
+                alert_key TEXT PRIMARY KEY,
+                alert_type TEXT NOT NULL,
+                patient_id TEXT NOT NULL,
+                drug TEXT,
+                severity TEXT,
+                alert_name TEXT,
+                status TEXT NOT NULL DEFAULT 'Open',
+                assigned_to TEXT,
+                reviewer TEXT,
+                notes TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+
+def make_alert_key(*parts) -> str:
+    raw = "|".join([str(part) for part in parts])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:18]
+
+
+def load_alert_reviews() -> pd.DataFrame:
+    init_alert_review_db()
+    with get_alert_review_connection() as conn:
+        return pd.read_sql_query("SELECT * FROM alert_reviews", conn)
+
+
+def upsert_alert_review(
+    alert_key: str,
+    alert_type: str,
+    patient_id: str,
+    drug: str,
+    severity: str,
+    alert_name: str,
+    status: str,
+    assigned_to: str,
+    reviewer: str,
+    notes: str,
+):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with get_alert_review_connection() as conn:
+        existing = conn.execute(
+            "SELECT created_at FROM alert_reviews WHERE alert_key = ?",
+            (alert_key,),
+        ).fetchone()
+        created_at = existing[0] if existing else now
+        conn.execute(
+            """
+            INSERT INTO alert_reviews (
+                alert_key, alert_type, patient_id, drug, severity, alert_name,
+                status, assigned_to, reviewer, notes, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(alert_key) DO UPDATE SET
+                alert_type = excluded.alert_type,
+                patient_id = excluded.patient_id,
+                drug = excluded.drug,
+                severity = excluded.severity,
+                alert_name = excluded.alert_name,
+                status = excluded.status,
+                assigned_to = excluded.assigned_to,
+                reviewer = excluded.reviewer,
+                notes = excluded.notes,
+                updated_at = excluded.updated_at
+            """,
+            (
+                alert_key,
+                alert_type,
+                patient_id,
+                drug,
+                severity,
+                alert_name,
+                status,
+                assigned_to,
+                reviewer,
+                notes,
+                created_at,
+                now,
+            ),
+        )
+        conn.commit()
+
+
+def build_alert_review_feed(
+    rules_alerts: pd.DataFrame,
+    ml_alerts: pd.DataFrame,
+    timing_flags_df: pd.DataFrame,
+    reviews_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Combine rule alerts, ML anomalies, and dose-timing flags into one review queue."""
+    alert_rows = []
+
+    if not rules_alerts.empty:
+        for _, row in rules_alerts.iterrows():
+            patient_id = str(row.get("patient_id", "")).strip()
+            drug = str(row.get("drug", "")).strip()
+            rule = str(row.get("rule", "Rule-Based Alert")).strip()
+            severity = str(row.get("severity", "Medium")).strip()
+            alert_rows.append({
+                "alert_key": make_alert_key("RULE", patient_id, drug, rule, severity),
+                "alert_type": "Rule-Based",
+                "patient_id": patient_id,
+                "drug": drug,
+                "severity": severity,
+                "alert_name": rule,
+                "alert_detail": f"{severity} rule alert: {rule}",
+                "event_time": "",
+            })
+
+    if not ml_alerts.empty:
+        for _, row in ml_alerts.iterrows():
+            patient_id = str(row.get("patient_id", "")).strip()
+            drug = str(row.get("drug", "")).strip()
+            anomaly_score = row.get("anomaly_score", "")
+            alert_rows.append({
+                "alert_key": make_alert_key("ML", patient_id, drug, anomaly_score),
+                "alert_type": "ML Anomaly",
+                "patient_id": patient_id,
+                "drug": drug,
+                "severity": "Medium",
+                "alert_name": "ML anomaly detected",
+                "alert_detail": f"Anomalous pattern detected; anomaly score: {anomaly_score}",
+                "event_time": "",
+            })
+
+    if not timing_flags_df.empty:
+        timing_alerts = timing_flags_df[timing_flags_df["dose_timing_alert"] == True].copy()
+        for _, row in timing_alerts.iterrows():
+            patient_id = str(row.get("patient_id", "")).strip()
+            drug = str(row.get("drug", "")).strip()
+            event_id = row.get("id", "")
+            flags = []
+            if bool(row.get("early_redose_flag", False)):
+                flags.append("early redosing")
+            if bool(row.get("frequent_6h_flag", False)):
+                flags.append("3+ doses within 6 hours")
+            if bool(row.get("frequent_24h_flag", False)):
+                flags.append("4+ doses within 24 hours")
+            if bool(row.get("nighttime_use_flag", False)):
+                flags.append("nighttime use")
+            if bool(row.get("long_gap_flag", False)):
+                flags.append("long gap")
+            alert_name = ", ".join(flags) if flags else "Suspicious dose timing"
+            severity = "High" if any(flag in alert_name for flag in ["early redosing", "3+ doses", "4+ doses"]) else "Medium"
+            alert_rows.append({
+                "alert_key": make_alert_key("TIMING", event_id, patient_id, drug, alert_name),
+                "alert_type": "Dose Timing",
+                "patient_id": patient_id,
+                "drug": drug,
+                "severity": severity,
+                "alert_name": alert_name,
+                "alert_detail": f"Timing alert: {alert_name}",
+                "event_time": row.get("event_time", ""),
+            })
+
+    queue = pd.DataFrame(alert_rows)
+    if queue.empty:
+        return pd.DataFrame(columns=[
+            "alert_key", "alert_type", "patient_id", "drug", "severity", "alert_name",
+            "alert_detail", "event_time", "status", "assigned_to", "reviewer", "notes", "updated_at"
+        ])
+
+    if reviews_df.empty:
+        queue["status"] = "Open"
+        queue["assigned_to"] = ""
+        queue["reviewer"] = ""
+        queue["notes"] = ""
+        queue["updated_at"] = ""
+    else:
+        review_cols = ["alert_key", "status", "assigned_to", "reviewer", "notes", "updated_at"]
+        available_review_cols = [col for col in review_cols if col in reviews_df.columns]
+        queue = queue.merge(reviews_df[available_review_cols], on="alert_key", how="left")
+        queue["status"] = queue["status"].fillna("Open")
+        for col in ["assigned_to", "reviewer", "notes", "updated_at"]:
+            if col not in queue.columns:
+                queue[col] = ""
+            queue[col] = queue[col].fillna("")
+
+    queue["status_rank"] = queue["status"].map(ALERT_STATUS_ORDER).fillna(0).astype(int)
+    severity_rank = {"High": 0, "Medium": 1, "Low": 2}
+    queue["severity_rank"] = queue["severity"].map(severity_rank).fillna(3).astype(int)
+    queue = queue.sort_values(["status_rank", "severity_rank", "patient_id", "drug"])
+
+    return queue
+
 # ------------------------------------------------------------
 # Data loading and detection pipeline
 # ------------------------------------------------------------
 init_db()
+init_alert_review_db()
 
 st.sidebar.title("System Controls")
 st.sidebar.markdown("SIEM-based Risk Monitoring")
+
+# Public prototype mode: no login, no role gate.
+current_role = "Public Demo"
+active_patient_id = ""
 
 mode = st.sidebar.selectbox(
     "Application Mode",
@@ -811,6 +1212,11 @@ st.sidebar.success("SIEM Engine: ACTIVE")
 
 st.title("National Opioid Risk Intelligence Platform (NORIP)")
 st.caption("Cybersecurity-driven anomaly detection and public health monitoring platform")
+st.warning(
+    "Public Research Prototype — Demo Data Only. "
+    "This platform is for educational and research purposes. "
+    "It does not use real patient data and is not intended for clinical decision-making."
+)
 
 try:
     if uploaded_file is not None:
@@ -867,6 +1273,9 @@ except Exception as e:
     st.error(f"Error running detection: {e}")
     st.stop()
 
+timing_flags_df = build_dose_timing_flags(events_df)
+alert_reviews_df = load_alert_reviews()
+alert_review_feed_df = build_alert_review_feed(rules_alerts, ml_alerts, timing_flags_df, alert_reviews_df)
 behavior_df = build_patient_behavior_features(events_df)
 alert_features_df = build_alert_features(rules_alerts, ml_alerts)
 df = compute_enhanced_risk_scores(df, behavior_df, alert_features_df)
@@ -967,30 +1376,114 @@ if mode == "Demo Overview":
 
 
 # ------------------------------------------------------------
-# Patient View
+# Patient View - Phone-Friendly Patient Page
 # ------------------------------------------------------------
 elif mode == "Patient View":
-    st.subheader("Medication Intake Logging")
-    st.write("Submit a medication intake event to update adherence tracking and patient risk visibility.")
 
-    with st.form("patient_form"):
-        p_id = st.text_input("Patient ID")
-        submitted_by = st.text_input("Submitted By")
-        drug = st.text_input("Drug")
-        dose = st.number_input("Dose Taken (mg)", min_value=0.0, step=1.0)
-        status = st.selectbox("Dose Status", ["Taken", "Missed"])
+    st.markdown(
+        """
+        <style>
+        .mobile-shell { max-width: 620px; margin: 0 auto; }
+        .mobile-card {
+            background: #ffffff;
+            border: 1px solid #e8ecf2;
+            border-radius: 22px;
+            padding: 20px;
+            box-shadow: 0 4px 16px rgba(0,0,0,0.06);
+            margin-bottom: 18px;
+        }
+        .mobile-title { font-size: 1.35rem; font-weight: 800; color: #111827; margin-bottom: 6px; }
+        .mobile-subtitle { font-size: 0.92rem; color: #6b7280; margin-bottom: 12px; }
+        .quick-status {
+            font-size: 0.9rem;
+            font-weight: 700;
+            padding: 8px 12px;
+            border-radius: 999px;
+            display: inline-block;
+            background: #eef2ff;
+            color: #3730a3;
+            border: 1px solid #c7d2fe;
+        }
+        div[data-testid="stForm"] button {
+            min-height: 3.2rem;
+            border-radius: 14px;
+            font-weight: 800;
+            font-size: 1.05rem;
+        }
+        @media (max-width: 700px) {
+            .block-container { padding-left: 0.8rem; padding-right: 0.8rem; }
+            .mobile-card { padding: 16px; border-radius: 18px; }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown('<div class="mobile-shell">', unsafe_allow_html=True)
+    st.markdown(
+        """
+        <div class="mobile-card">
+            <div class="mobile-title">Patient Medication Check-In</div>
+            <div class="mobile-subtitle">
+                Log your dose quickly. The system automatically records the submission time for monitoring and audit purposes.
+            </div>
+            <span class="quick-status">Phone-friendly patient mode</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    default_patient_id = active_patient_id if current_role == "Patient" else ""
+
+    with st.form("mobile_patient_form", clear_on_submit=False):
+        st.markdown("### Today's Dose")
+
+        p_id = st.text_input(
+            "Patient ID",
+            value=default_patient_id,
+            disabled=True if current_role == "Patient" else False,
+            help="Patient role is locked to the authenticated Patient ID.",
+        )
+
+        submitted_by_default = active_patient_id if current_role == "Patient" else ""
+        submitted_by = st.text_input("Submitted By", value=submitted_by_default)
+
+        drug = st.text_input("Medication", placeholder="Example: Oxycodone")
+        dose = st.number_input("Dose Taken (mg)", min_value=0.0, step=1.0, value=0.0)
         zip_code = st.number_input("ZIP Code", min_value=0, step=1)
+
+        st.markdown("#### Scheduled Dose Time")
         scheduled_date = st.date_input("Scheduled Dose Date", value=date.today())
         scheduled_clock = st.time_input("Scheduled Dose Time", value=time(8, 0))
-        submit = st.form_submit_button("Submit Event")
 
-    if submit:
+        st.markdown("#### How are you feeling?")
+        pain_level = st.slider("Pain Level", 0, 10, 0, help="0 = no pain, 10 = worst pain")
+        side_effects = st.text_area(
+            "Side Effects / Notes",
+            placeholder="Optional: nausea, dizziness, unusual symptoms, or context for this dose",
+            height=90,
+        )
+
+        st.markdown("#### Quick Log")
+        taken_col, missed_col = st.columns(2)
+        with taken_col:
+            taken_submit = st.form_submit_button("Taken")
+        with missed_col:
+            missed_submit = st.form_submit_button("Missed")
+
+    submitted_status = None
+    if taken_submit:
+        submitted_status = "Taken"
+    elif missed_submit:
+        submitted_status = "Missed"
+
+    if submitted_status:
         validation = validate_event_input(
             patient_id=p_id,
             submitted_by=submitted_by,
             drug=drug,
             dose=dose,
-            status=status,
+            status=submitted_status,
             zip_code=int(zip_code),
             scheduled_date=scheduled_date,
             scheduled_clock=scheduled_clock,
@@ -1007,7 +1500,7 @@ elif mode == "Patient View":
             cleaned_drug = validation["cleaned_drug"]
             cleaned_submitter = validation["cleaned_submitted_by"]
             scheduled_dt = validation["scheduled_dt"].strftime("%Y-%m-%d %H:%M:%S")
-            final_dose = dose if status == "Taken" else 0
+            final_dose = dose if submitted_status == "Taken" else 0
 
             event_payload = {
                 "drug": cleaned_drug,
@@ -1015,8 +1508,11 @@ elif mode == "Patient View":
                 "days_supply": 1,
                 "refill_count": 0,
                 "zip_code": int(zip_code),
-                "status": status,
+                "status": submitted_status,
                 "scheduled_time": scheduled_dt,
+                "pain_level": int(pain_level),
+                "side_effects_notes": side_effects.strip(),
+                "logged_from": "phone_friendly_patient_page",
             }
 
             event_id = insert_event(
@@ -1027,7 +1523,7 @@ elif mode == "Patient View":
                 days_supply=1,
                 refill_count=0,
                 zip_code=int(zip_code),
-                status=status,
+                status=submitted_status,
                 scheduled_time=scheduled_dt,
                 submitted_by=cleaned_submitter,
             )
@@ -1041,67 +1537,83 @@ elif mode == "Patient View":
                 new_value=event_payload,
             )
 
-            st.success("Medication event recorded successfully.")
+            st.success(f"Dose logged as {submitted_status}. Your submission time was recorded automatically.")
             st.rerun()
 
     st.markdown("---")
-    st.subheader("Your Medication History")
+    st.markdown("### My Medication Summary")
+
+    patient_id_input = default_patient_id if current_role == "Patient" else str(p_id).strip()
 
     if events_df.empty:
-        st.info("No records yet.")
+        st.info("No medication history has been recorded yet.")
+    elif not patient_id_input:
+        st.info("Enter a Patient ID above to view medication history.")
     else:
-        patient_id_input = p_id.strip()
+        patient_history = events_df[events_df["patient_id"] == patient_id_input].copy()
 
-        if patient_id_input:
-            patient_history = events_df[events_df["patient_id"] == patient_id_input].copy()
-
-            if patient_history.empty:
-                st.info("No records found for this patient.")
-            else:
-                patient_history["event_time"] = pd.to_datetime(patient_history["event_time"], errors="coerce")
-                patient_history["scheduled_time"] = pd.to_datetime(patient_history["scheduled_time"], errors="coerce")
-                patient_history = patient_history.sort_values("event_time", ascending=False)
-
-                taken = patient_history[patient_history["status"] == "Taken"]
-                missed = patient_history[patient_history["status"] == "Missed"]
-                adherence = round((len(taken) / len(patient_history)) * 100, 1)
-
-                patient_last_intake_raw = patient_history["event_time"].max()
-                patient_last_intake = (
-                    patient_last_intake_raw.strftime("%Y-%m-%d %H:%M")
-                    if pd.notna(patient_last_intake_raw)
-                    else "No events recorded"
-                )
-
-                patient_risk_profile = df[df["patient_id"] == patient_id_input].copy()
-                if not patient_risk_profile.empty:
-                    patient_risk_row = patient_risk_profile.sort_values("risk_score", ascending=False).iloc[0]
-                    patient_risk_label = get_status_label(patient_risk_row["risk_level"])
-                else:
-                    patient_risk_label = "Unknown"
-
-                s1, s2, s3, s4 = st.columns(4)
-                s1.metric("Adherence %", adherence)
-                s2.metric("Missed Doses", len(missed))
-                s3.metric("Last Intake", patient_last_intake)
-                s4.metric("Current Risk", patient_risk_label)
-
-                st.dataframe(patient_history, use_container_width=True)
-
-                fig_patient_timeline = px.scatter(
-                    patient_history.sort_values("event_time"),
-                    x="event_time",
-                    y="drug",
-                    color="status",
-                    hover_data=["dosage_mg", "scheduled_time", "taken_on_time"],
-                    title=f"Medication Timeline for {patient_id_input}",
-                    labels={"event_time": "Event Time", "drug": "Medication"},
-                )
-                fig_patient_timeline.update_layout(height=420)
-                st.plotly_chart(fig_patient_timeline, use_container_width=True)
+        if patient_history.empty:
+            st.info("No records found for this patient yet.")
         else:
-            st.info("Enter your Patient ID above to view your history.")
+            patient_history["event_time"] = pd.to_datetime(patient_history["event_time"], errors="coerce")
+            patient_history["scheduled_time"] = pd.to_datetime(patient_history["scheduled_time"], errors="coerce")
+            patient_history = patient_history.sort_values("event_time", ascending=False)
 
+            taken = patient_history[patient_history["status"] == "Taken"]
+            missed = patient_history[patient_history["status"] == "Missed"]
+            adherence = round((len(taken) / len(patient_history)) * 100, 1) if len(patient_history) else 0.0
+            on_time = int(patient_history["taken_on_time"].fillna(0).sum()) if "taken_on_time" in patient_history.columns else 0
+
+            patient_last_intake_raw = patient_history["event_time"].max()
+            patient_last_intake = (
+                patient_last_intake_raw.strftime("%Y-%m-%d %H:%M")
+                if pd.notna(patient_last_intake_raw)
+                else "No events recorded"
+            )
+
+            patient_risk_profile = df[df["patient_id"] == patient_id_input].copy()
+            if not patient_risk_profile.empty:
+                patient_risk_row = patient_risk_profile.sort_values("risk_score", ascending=False).iloc[0]
+                patient_risk_label = get_status_label(patient_risk_row["risk_level"])
+            else:
+                patient_risk_label = "Unknown"
+
+            s1, s2 = st.columns(2)
+            s1.metric("Adherence", f"{adherence}%")
+            s2.metric("Current Status", patient_risk_label)
+
+            s3, s4 = st.columns(2)
+            s3.metric("Missed Doses", len(missed))
+            s4.metric("Taken On Time", on_time)
+
+            st.caption(f"Last reported intake: {patient_last_intake}")
+
+            st.markdown("#### Recent Medication History")
+            display_cols = [c for c in [
+                "drug",
+                "status",
+                "dosage_mg",
+                "scheduled_time",
+                "event_time",
+                "taken_on_time",
+                "submitted_by",
+            ] if c in patient_history.columns]
+            st.dataframe(patient_history[display_cols].head(10), use_container_width=True)
+
+            st.markdown("#### Timeline")
+            fig_patient_timeline = px.scatter(
+                patient_history.sort_values("event_time"),
+                x="event_time",
+                y="drug",
+                color="status",
+                hover_data=[c for c in ["dosage_mg", "scheduled_time", "taken_on_time"] if c in patient_history.columns],
+                title=f"Medication Timeline for {patient_id_input}",
+                labels={"event_time": "Event Time", "drug": "Medication"},
+            )
+            fig_patient_timeline.update_layout(height=390, margin=dict(t=55, b=30, l=20, r=20))
+            st.plotly_chart(fig_patient_timeline, use_container_width=True)
+
+    st.markdown('</div>', unsafe_allow_html=True)
 
 # ------------------------------------------------------------
 # Analyst View
@@ -1164,6 +1676,35 @@ elif mode == "Analyst View":
                             "daily_behavior_score",
                             "rolling_risk_score",
                             "risk_delta",
+                        ]
+                    ].head(10),
+                    use_container_width=True,
+                )
+
+        st.markdown("#### Suspicious Dose Timing Watchlist")
+        if timing_flags_df.empty:
+            st.info("No suspicious dose timing data available yet.")
+        else:
+            timing_watchlist = timing_flags_df[timing_flags_df["dose_timing_alert"] == True].sort_values(
+                "event_time", ascending=False
+            )
+            if timing_watchlist.empty:
+                st.success("No suspicious dose timing patterns detected.")
+            else:
+                st.dataframe(
+                    timing_watchlist[
+                        [
+                            "patient_id",
+                            "drug",
+                            "event_time",
+                            "hours_since_last_taken",
+                            "taken_count_6h",
+                            "taken_count_24h",
+                            "early_redose_flag",
+                            "frequent_6h_flag",
+                            "frequent_24h_flag",
+                            "nighttime_use_flag",
+                            "long_gap_flag",
                         ]
                     ].head(10),
                     use_container_width=True,
@@ -1333,6 +1874,44 @@ elif mode == "Analyst View":
                                 )
                                 fig_status.update_layout(height=420)
                                 st.plotly_chart(fig_status, use_container_width=True)
+
+                    st.markdown("---")
+                    st.markdown("#### Dose Frequency & Timing Alerts")
+                    patient_timing_flags = timing_flags_df[
+                        timing_flags_df["patient_id"] == selected_patient
+                    ].copy() if not timing_flags_df.empty else pd.DataFrame()
+
+                    if patient_timing_flags.empty:
+                        st.info("No dose timing records available for this patient yet.")
+                    else:
+                        timing_alerts_only = patient_timing_flags[patient_timing_flags["dose_timing_alert"] == True]
+                        tf1, tf2, tf3, tf4 = st.columns(4)
+                        tf1.metric("Early Redoses", int(patient_timing_flags["early_redose_flag"].sum()))
+                        tf2.metric("3+ Doses / 6h", int(patient_timing_flags["frequent_6h_flag"].sum()))
+                        tf3.metric("4+ Doses / 24h", int(patient_timing_flags["frequent_24h_flag"].sum()))
+                        tf4.metric("Nighttime Uses", int(patient_timing_flags["nighttime_use_flag"].sum()))
+
+                        if timing_alerts_only.empty:
+                            st.success("No suspicious dose frequency patterns detected for this patient.")
+                        else:
+                            st.warning(f"{len(timing_alerts_only)} suspicious dose timing event(s) detected.")
+                            st.dataframe(
+                                timing_alerts_only[
+                                    [
+                                        "event_time",
+                                        "drug",
+                                        "hours_since_last_taken",
+                                        "taken_count_6h",
+                                        "taken_count_24h",
+                                        "early_redose_flag",
+                                        "frequent_6h_flag",
+                                        "frequent_24h_flag",
+                                        "nighttime_use_flag",
+                                        "long_gap_flag",
+                                    ]
+                                ],
+                                use_container_width=True,
+                            )
 
                     st.markdown("---")
                     st.markdown("#### Risk Trend Over Time")
@@ -1543,33 +2122,160 @@ elif mode == "Analyst View":
                             st.rerun()
 
     with tab3:
-        st.markdown('<div class="section-title">Alert Center</div>', unsafe_allow_html=True)
-        st.markdown('<div class="section-sub">Current rule-based and anomaly-based alerts for analyst review.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Alert Review Workflow</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="section-sub">Review, assign, escalate, resolve, or mark alerts as false positives.</div>',
+            unsafe_allow_html=True,
+        )
 
-        a1, a2 = st.columns(2)
-        with a1:
-            st.markdown("#### Rule-Based Alerts")
-            if rules_alerts.empty:
-                st.info("No rule-based alerts found.")
-            else:
-                st.write(rules_alerts.style.apply(color_row, axis=1))
-
-        with a2:
-            st.markdown("#### ML Anomaly Alerts")
-            if ml_alerts.empty:
-                st.info("No ML anomalies found.")
-            else:
-                st.dataframe(ml_alerts, use_container_width=True)
-
-        st.markdown("#### Active Alert Feed")
-        if rules_alerts.empty:
-            st.success("No active alerts at this time.")
+        if alert_review_feed_df.empty:
+            st.success("No active alerts are available for review right now.")
         else:
-            for _, row in rules_alerts.iterrows():
-                if row["severity"] == "High":
-                    st.error(f"HIGH: {row['rule']} — Patient {row['patient_id']} ({row['drug']})")
-                elif row["severity"] == "Medium":
-                    st.warning(f"MEDIUM: {row['rule']} — Patient {row['patient_id']} ({row['drug']})")
+            open_count = int((alert_review_feed_df["status"] == "Open").sum())
+            reviewed_count = int((alert_review_feed_df["status"] == "Reviewed").sum())
+            escalated_count = int((alert_review_feed_df["status"] == "Escalated").sum())
+            closed_count = int((alert_review_feed_df["status"].isin(["Resolved", "False Positive"])).sum())
+
+            q1, q2, q3, q4 = st.columns(4)
+            q1.metric("Open", open_count)
+            q2.metric("Reviewed", reviewed_count)
+            q3.metric("Escalated", escalated_count)
+            q4.metric("Closed", closed_count)
+
+            st.markdown("#### Alert Queue Filters")
+            f1, f2, f3 = st.columns(3)
+            with f1:
+                selected_statuses = st.multiselect(
+                    "Status",
+                    options=ALERT_STATUSES,
+                    default=["Open", "Reviewed", "Escalated"],
+                )
+            with f2:
+                selected_alert_types = st.multiselect(
+                    "Alert Type",
+                    options=sorted(alert_review_feed_df["alert_type"].dropna().unique().tolist()),
+                    default=sorted(alert_review_feed_df["alert_type"].dropna().unique().tolist()),
+                )
+            with f3:
+                selected_severities = st.multiselect(
+                    "Severity",
+                    options=sorted(alert_review_feed_df["severity"].dropna().unique().tolist()),
+                    default=sorted(alert_review_feed_df["severity"].dropna().unique().tolist()),
+                )
+
+            filtered_alert_queue = alert_review_feed_df.copy()
+            if selected_statuses:
+                filtered_alert_queue = filtered_alert_queue[filtered_alert_queue["status"].isin(selected_statuses)]
+            if selected_alert_types:
+                filtered_alert_queue = filtered_alert_queue[filtered_alert_queue["alert_type"].isin(selected_alert_types)]
+            if selected_severities:
+                filtered_alert_queue = filtered_alert_queue[filtered_alert_queue["severity"].isin(selected_severities)]
+
+            display_cols = [
+                "alert_type",
+                "severity",
+                "status",
+                "patient_id",
+                "drug",
+                "alert_name",
+                "assigned_to",
+                "reviewer",
+                "updated_at",
+                "notes",
+            ]
+            st.markdown("#### Unified Alert Queue")
+            if filtered_alert_queue.empty:
+                st.info("No alerts match the selected filters.")
+            else:
+                st.dataframe(filtered_alert_queue[display_cols], use_container_width=True)
+
+            st.markdown("#### Review Selected Alert")
+            review_options_df = filtered_alert_queue.copy() if not filtered_alert_queue.empty else alert_review_feed_df.copy()
+            review_options_df["alert_label"] = review_options_df.apply(
+                lambda row: f"{row['status']} | {row['severity']} | {row['alert_type']} | Patient {row['patient_id']} | {row['alert_name']}",
+                axis=1,
+            )
+
+            selected_alert_label = st.selectbox(
+                "Select Alert",
+                review_options_df["alert_label"].tolist(),
+                key="selected_alert_for_review",
+            )
+            selected_alert = review_options_df[review_options_df["alert_label"] == selected_alert_label].iloc[0]
+
+            d1, d2 = st.columns([1.2, 2])
+            with d1:
+                st.markdown("**Alert Details**")
+                st.write(f"**Type:** {selected_alert['alert_type']}")
+                st.write(f"**Severity:** {selected_alert['severity']}")
+                st.write(f"**Patient:** {selected_alert['patient_id']}")
+                st.write(f"**Drug:** {selected_alert['drug']}")
+                st.write(f"**Status:** {selected_alert['status']}")
+            with d2:
+                st.markdown("**Description**")
+                st.write(selected_alert["alert_detail"])
+                if selected_alert.get("notes", ""):
+                    st.markdown("**Existing Notes**")
+                    st.write(selected_alert.get("notes", ""))
+
+            current_status = selected_alert.get("status", "Open")
+            current_status_index = ALERT_STATUSES.index(current_status) if current_status in ALERT_STATUSES else 0
+
+            with st.form("alert_review_form"):
+                new_status = st.selectbox(
+                    "Update Status",
+                    ALERT_STATUSES,
+                    index=current_status_index,
+                )
+                assigned_to = st.text_input("Assigned To", value=selected_alert.get("assigned_to", ""))
+                reviewer = st.text_input("Reviewed By", value=selected_alert.get("reviewer", ""))
+                notes = st.text_area("Review Notes", value=selected_alert.get("notes", ""), height=120)
+                save_review = st.form_submit_button("Save Alert Review")
+
+            if save_review:
+                upsert_alert_review(
+                    alert_key=selected_alert["alert_key"],
+                    alert_type=selected_alert["alert_type"],
+                    patient_id=selected_alert["patient_id"],
+                    drug=selected_alert["drug"],
+                    severity=selected_alert["severity"],
+                    alert_name=selected_alert["alert_name"],
+                    status=new_status,
+                    assigned_to=assigned_to.strip(),
+                    reviewer=reviewer.strip(),
+                    notes=notes.strip(),
+                )
+                st.success("Alert review saved successfully.")
+                st.rerun()
+
+            st.markdown("#### Status Breakdown")
+            status_counts = alert_review_feed_df["status"].value_counts().reset_index()
+            status_counts.columns = ["Status", "Count"]
+            fig_status_workflow = px.bar(
+                status_counts,
+                x="Status",
+                y="Count",
+                title="Alert Review Status Breakdown",
+                labels={"Count": "Number of Alerts"},
+            )
+            fig_status_workflow.update_layout(height=360)
+            st.plotly_chart(fig_status_workflow, use_container_width=True)
+
+            st.markdown("#### Original Detection Outputs")
+            a1, a2 = st.columns(2)
+            with a1:
+                st.markdown("##### Rule-Based Alerts")
+                if rules_alerts.empty:
+                    st.info("No rule-based alerts found.")
+                else:
+                    st.write(rules_alerts.style.apply(color_row, axis=1))
+
+            with a2:
+                st.markdown("##### ML Anomaly Alerts")
+                if ml_alerts.empty:
+                    st.info("No ML anomalies found.")
+                else:
+                    st.dataframe(ml_alerts, use_container_width=True)
 
     with tab4:
         st.markdown('<div class="section-title">Risk Analytics</div>', unsafe_allow_html=True)
@@ -1741,6 +2447,12 @@ elif mode == "Analyst View":
             "missed_streak",
             "late_streak",
             "timing_variability_hours",
+            "early_redose_count",
+            "frequent_dose_6h_count",
+            "frequent_dose_24h_count",
+            "nighttime_use_count",
+            "long_gap_count",
+            "dose_timing_alert_count",
             "medium_alert_count",
             "high_alert_count",
             "ml_alert_count",
@@ -1812,6 +2524,12 @@ elif mode == "Analyst View":
                         "missed_streak": summary_row.get("missed_streak", ""),
                         "late_streak": summary_row.get("late_streak", ""),
                         "timing_variability_hours": summary_row.get("timing_variability_hours", ""),
+                        "early_redose_count": summary_row.get("early_redose_count", ""),
+                        "frequent_dose_6h_count": summary_row.get("frequent_dose_6h_count", ""),
+                        "frequent_dose_24h_count": summary_row.get("frequent_dose_24h_count", ""),
+                        "nighttime_use_count": summary_row.get("nighttime_use_count", ""),
+                        "long_gap_count": summary_row.get("long_gap_count", ""),
+                        "dose_timing_alert_count": summary_row.get("dose_timing_alert_count", ""),
                         "anomaly_severity": summary_row.get("anomaly_severity", ""),
                     }])
                 else:
@@ -1831,6 +2549,20 @@ elif mode == "Analyst View":
                     "high_rule_alerts": int((patient_rule_alerts["severity"] == "High").sum()) if not patient_rule_alerts.empty else 0,
                     "medium_rule_alerts": int((patient_rule_alerts["severity"] == "Medium").sum()) if not patient_rule_alerts.empty else 0,
                     "total_ml_alerts": len(patient_ml_alerts),
+                }])
+
+                report_timing_flags = timing_flags_df[
+                    timing_flags_df["patient_id"] == report_patient
+                ].copy() if not timing_flags_df.empty else pd.DataFrame()
+
+                timing_alert_summary = pd.DataFrame([{
+                    "patient_id": report_patient,
+                    "early_redose_events": int(report_timing_flags["early_redose_flag"].sum()) if not report_timing_flags.empty else 0,
+                    "frequent_6h_events": int(report_timing_flags["frequent_6h_flag"].sum()) if not report_timing_flags.empty else 0,
+                    "frequent_24h_events": int(report_timing_flags["frequent_24h_flag"].sum()) if not report_timing_flags.empty else 0,
+                    "nighttime_use_events": int(report_timing_flags["nighttime_use_flag"].sum()) if not report_timing_flags.empty else 0,
+                    "long_gap_events": int(report_timing_flags["long_gap_flag"].sum()) if not report_timing_flags.empty else 0,
+                    "total_dose_timing_alerts": int(report_timing_flags["dose_timing_alert"].sum()) if not report_timing_flags.empty else 0,
                 }])
 
                 timeline_cols = [c for c in [
@@ -1870,6 +2602,9 @@ elif mode == "Analyst View":
                     }])
                     st.dataframe(adherence_preview, use_container_width=True)
 
+                st.markdown("#### Dose Timing Alert Summary")
+                st.dataframe(timing_alert_summary, use_container_width=True)
+
                 st.markdown("#### Medication Event Timeline")
                 st.dataframe(timeline_df, use_container_width=True)
 
@@ -1883,6 +2618,9 @@ elif mode == "Analyst View":
                     pd.DataFrame([{"REPORT_SECTION": "ADHERENCE_SUMMARY"}]),
                     adherence_preview,
                     pd.DataFrame([{}]),
+                    pd.DataFrame([{"REPORT_SECTION": "DOSE_TIMING_ALERT_SUMMARY"}]),
+                    timing_alert_summary,
+                    pd.DataFrame([{}]),
                     pd.DataFrame([{"REPORT_SECTION": "MEDICATION_EVENT_TIMELINE"}]),
                     timeline_df,
                 ], ignore_index=True)
@@ -1895,6 +2633,11 @@ elif mode == "Analyst View":
                 )
 
     with tab6:
+        if not permissions["can_view_audit_trail"]:
+            st.markdown('<div class="section-title">Audit Trail</div>', unsafe_allow_html=True)
+            st.error("Access denied. Audit trail is Admin-only.")
+            st.stop()
+
         st.markdown('<div class="section-title">Audit Trail</div>', unsafe_allow_html=True)
         st.markdown(
             '<div class="section-sub">Review who submitted data, when it was submitted, and exactly what changed.</div>',
@@ -1976,3 +2719,4 @@ elif mode == "Analyst View":
                         st.dataframe(changed_df.style.apply(highlight_changes, axis=1), use_container_width=True)
                     else:
                         st.caption("No field-level differences detected.")
+
