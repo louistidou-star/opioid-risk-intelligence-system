@@ -234,27 +234,24 @@ Future iterations of the system may include secure authentication, medication-sp
 ## Technologies
 
 The platform is implemented using Python and Streamlit for the interface layer, with data processing handled through Pandas and machine learning components built using Scikit-learn. Visualization is supported through Plotly, and persistence is managed using SQLite.
->>>>>>> f24303a (Convert to public demo prototype: No  access controls)
+
 
 ---
 
 ## Author
 
-<<<<<<< HEAD
 Louis Tidou
 Technology Management (Cybersecurity)
 =======
 Louis Tidou (louistidou@gmail.com)
 M.S. Technology Management (Cybersecurity)
->>>>>>> f24303a (Convert to public demo prototype: No  access controls)
 University of Bridgeport
 
 ---
 
 ## License
 
-<<<<<<< HEAD
 This project is for educational and research purposes.
 =======
 This project is intended for research, educational, and demonstration purposes.
->>>>>>> f24303a (Convert to public demo prototype: No  access controls)
+
