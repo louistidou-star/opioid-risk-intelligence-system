@@ -1,0 +1,35 @@
+{
+  "training_rows": 5005,
+  "positive_high_risk_rows": 3129,
+  "negative_lower_risk_rows": 1876,
+  "accuracy": 0.9776357827476039,
+  "roc_auc": 0.9964109392827869,
+  "classification_report": {
+    "0": {
+      "precision": 0.9803921568627451,
+      "recall": 0.9594882729211087,
+      "f1-score": 0.9698275862068966,
+      "support": 469.0
+    },
+    "1": {
+      "precision": 0.9760403530895334,
+      "recall": 0.9885057471264368,
+      "f1-score": 0.9822335025380711,
+      "support": 783.0
+    },
+    "accuracy": 0.9776357827476039,
+    "macro avg": {
+      "precision": 0.9782162549761393,
+      "recall": 0.9739970100237727,
+      "f1-score": 0.9760305443724838,
+      "support": 1252.0
+    },
+    "weighted avg": {
+      "precision": 0.9776705415636838,
+      "recall": 0.9776357827476039,
+      "f1-score": 0.9775862383533099,
+      "support": 1252.0
+    }
+  },
+  "note": "Prototype model trained on project/synthetic data with rule-derived labels. Replace target_high_risk with real outcome or expert-reviewed labels for clinical validation."
+}

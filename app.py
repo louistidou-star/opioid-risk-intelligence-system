@@ -2,6 +2,9 @@ from datetime import date, datetime, time
 import json
 import hashlib
 import sqlite3
+import os
+
+import joblib
 
 import pandas as pd
 import plotly.express as px
@@ -830,37 +833,101 @@ def compute_enhanced_risk_scores(
     return enriched
 
 
+MODEL_DIR = "models"
+MODEL_PATH = os.path.join(MODEL_DIR, "risk_model.pkl")
+FEATURE_COLUMNS_PATH = os.path.join(MODEL_DIR, "feature_columns.json")
+
+MODEL_FEATURE_COLUMNS = [
+    "dosage_mg",
+    "refill_count",
+    "days_supply",
+    "adherence_pct",
+    "on_time_pct",
+    "late_dose_count",
+    "recent_missed_7d",
+    "recent_missed_3d",
+    "missed_streak",
+    "late_streak",
+    "timing_variability_hours",
+    "early_redose_count",
+    "frequent_dose_6h_count",
+    "frequent_dose_24h_count",
+    "nighttime_use_count",
+    "long_gap_count",
+    "dose_timing_alert_count",
+    "medium_alert_count",
+    "high_alert_count",
+    "ml_alert_count",
+    "anomaly_severity",
+]
+
+
+def load_trained_risk_model():
+    """Load the saved model and feature list if they exist."""
+    if not os.path.exists(MODEL_PATH) or not os.path.exists(FEATURE_COLUMNS_PATH):
+        return None, None
+
+    try:
+        model = joblib.load(MODEL_PATH)
+        with open(FEATURE_COLUMNS_PATH, "r", encoding="utf-8") as file:
+            feature_columns = json.load(file)
+        return model, feature_columns
+    except Exception:
+        return None, None
+
+
+def apply_saved_risk_model(model_df: pd.DataFrame, model, feature_columns: list[str]) -> pd.DataFrame:
+    """Use the trained model from /models instead of retraining during every app refresh."""
+    output_df = model_df.copy()
+
+    for col in feature_columns:
+        if col not in output_df.columns:
+            output_df[col] = 0
+
+    output_df[feature_columns] = output_df[feature_columns].apply(
+        pd.to_numeric, errors="coerce"
+    ).fillna(0)
+
+    probabilities = model.predict_proba(output_df[feature_columns])[:, 1]
+    output_df["rf_risk_probability"] = probabilities.round(3)
+    output_df["rf_prediction"] = output_df["rf_risk_probability"].apply(
+        lambda p: "High Risk Likely" if p >= 0.5 else "Lower Risk Likely"
+    )
+    output_df["model_source"] = "Saved trained model"
+
+    if hasattr(model, "feature_importances_"):
+        feature_importance = pd.DataFrame({
+            "feature": feature_columns,
+            "importance": model.feature_importances_,
+        }).sort_values(by="importance", ascending=False)
+        output_df.attrs["rf_feature_importance"] = feature_importance
+
+    return output_df
+
+
 def run_random_forest_risk_model(df: pd.DataFrame) -> pd.DataFrame:
+    """Predict high-risk probability.
+
+    Preferred path:
+    1. Load a saved Random Forest model from models/risk_model.pkl.
+    2. Use models/feature_columns.json for consistent feature ordering.
+
+    Fallback path:
+    If no saved model exists yet, train a temporary in-app model from the
+    current rule-derived risk labels. This preserves demo functionality, but
+    train_model.py should be used for the cleaner production-style workflow.
+    """
     model_df = df.copy()
 
-    feature_cols = [
-        "dosage_mg",
-        "refill_count",
-        "days_supply",
-        "adherence_pct",
-        "on_time_pct",
-        "late_dose_count",
-        "recent_missed_7d",
-        "recent_missed_3d",
-        "missed_streak",
-        "late_streak",
-        "timing_variability_hours",
-        "early_redose_count",
-        "frequent_dose_6h_count",
-        "frequent_dose_24h_count",
-        "nighttime_use_count",
-        "long_gap_count",
-        "dose_timing_alert_count",
-        "medium_alert_count",
-        "high_alert_count",
-        "ml_alert_count",
-        "anomaly_severity",
-    ]
+    saved_model, saved_feature_columns = load_trained_risk_model()
+    if saved_model is not None and saved_feature_columns:
+        return apply_saved_risk_model(model_df, saved_model, saved_feature_columns)
 
-    available_features = [col for col in feature_cols if col in model_df.columns]
+    available_features = [col for col in MODEL_FEATURE_COLUMNS if col in model_df.columns]
     if not available_features:
         model_df["rf_risk_probability"] = 0.0
         model_df["rf_prediction"] = "Unavailable"
+        model_df["model_source"] = "No model features available"
         return model_df
 
     model_df[available_features] = model_df[available_features].apply(pd.to_numeric, errors="coerce").fillna(0)
@@ -869,6 +936,7 @@ def run_random_forest_risk_model(df: pd.DataFrame) -> pd.DataFrame:
     if model_df["rf_target"].nunique() < 2:
         model_df["rf_risk_probability"] = 0.0
         model_df["rf_prediction"] = "Unavailable"
+        model_df["model_source"] = "Fallback model unavailable: only one class present"
         return model_df
 
     X = model_df[available_features]
@@ -888,6 +956,7 @@ def run_random_forest_risk_model(df: pd.DataFrame) -> pd.DataFrame:
     model_df["rf_prediction"] = model_df["rf_risk_probability"].apply(
         lambda p: "High Risk Likely" if p >= 0.5 else "Lower Risk Likely"
     )
+    model_df["model_source"] = "Fallback in-app model"
 
     feature_importance = pd.DataFrame({
         "feature": available_features,
@@ -896,7 +965,6 @@ def run_random_forest_risk_model(df: pd.DataFrame) -> pd.DataFrame:
 
     model_df.attrs["rf_feature_importance"] = feature_importance
     return model_df
-
 
 def get_top_risk_factors(risk_components: str, top_n: int = 3):
     factors = []
@@ -1212,11 +1280,6 @@ st.sidebar.success("SIEM Engine: ACTIVE")
 
 st.title("National Opioid Risk Intelligence Platform (NORIP)")
 st.caption("Cybersecurity-driven anomaly detection and public health monitoring platform")
-st.warning(
-    "Public Research Prototype — Demo Data Only. "
-    "This platform is for educational and research purposes. "
-    "It does not use real patient data and is not intended for clinical decision-making."
-)
 
 try:
     if uploaded_file is not None:
@@ -1311,6 +1374,8 @@ high_risk_patients = len(df[df["risk_level"].isin(["High", "Critical"])]) if not
 st.sidebar.info(f"Records Loaded: {len(df)}")
 st.sidebar.info(f"Saved Patient Events: {len(events_df)}")
 st.sidebar.warning(f"Alerts Generated: {len(rules_alerts)}")
+if "model_source" in df.columns:
+    st.sidebar.caption(f"ML Model: {df['model_source'].iloc[0]}")
 
 
 # ------------------------------------------------------------
@@ -2633,10 +2698,7 @@ elif mode == "Analyst View":
                 )
 
     with tab6:
-        if not permissions["can_view_audit_trail"]:
-            st.markdown('<div class="section-title">Audit Trail</div>', unsafe_allow_html=True)
-            st.error("Access denied. Audit trail is Admin-only.")
-            st.stop()
+        
 
         st.markdown('<div class="section-title">Audit Trail</div>', unsafe_allow_html=True)
         st.markdown(

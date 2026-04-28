@@ -1,0 +1,23 @@
+[
+  "dosage_mg",
+  "refill_count",
+  "days_supply",
+  "adherence_pct",
+  "on_time_pct",
+  "late_dose_count",
+  "recent_missed_7d",
+  "recent_missed_3d",
+  "missed_streak",
+  "late_streak",
+  "timing_variability_hours",
+  "early_redose_count",
+  "frequent_dose_6h_count",
+  "frequent_dose_24h_count",
+  "nighttime_use_count",
+  "long_gap_count",
+  "dose_timing_alert_count",
+  "medium_alert_count",
+  "high_alert_count",
+  "ml_alert_count",
+  "anomaly_severity"
+]
